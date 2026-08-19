@@ -362,14 +362,22 @@
   .day-item-chevron { color: var(--muted); font-size: 16px; margin-left: auto; padding-left: 4px; }
   .modal-box-edit { position: relative; max-width: 700px; }
   .modal-box-edit .modal-body { padding-top: 26px; }
+  .sync-status { font-size: 13px; padding: 4px 9px; border-radius: 20px; background: #fdf5fb; border: 1px solid var(--border); cursor: default; white-space: nowrap; }
+  .sync-status.sync-ok { background: #eafaf0; border-color: #b7e6c7; }
+  .sync-status.sync-err { background: #fdeceb; border-color: #f2bcb6; }
 </style>
 </head>
 <body>
+
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore-compat.js"></script>
 
 <header>
   <div class="brand-row">
     <h1>🌸 Côte d'Azur 🌸</h1>
     <div class="backup-btns">
+      <span class="sync-status" id="sync-status">📴 nur lokal</span>
       <button id="export-btn" title="Sichern">💾</button>
       <button id="import-trigger-btn" title="Wiederherstellen">📂</button>
       <input type="file" id="import-file-input" accept=".json" hidden>
@@ -383,7 +391,7 @@
 <div class="modal-overlay" id="detail-modal" style="display:none"></div>
 
 <footer>
-  ✨ Alles wird automatisch auf diesem Gerät gespeichert. Über 💾 kannst du ein Backup exportieren und über 📂 auf einem anderen Handy wieder einspielen. ✨
+  ✨ Alles wird automatisch auf diesem Gerät gespeichert – und, sobald die Cloud-Synchronisierung eingerichtet ist, auch auf allen anderen Geräten. Über 💾 kannst du zusätzlich jederzeit ein Backup exportieren und über 📂 wieder einspielen. ✨
   <br>
   <button id="reset-all-btn">Komplette App auf Originalzustand zurücksetzen</button>
 </footer>
@@ -586,6 +594,89 @@ function save() {
       saveWarned = true;
       alert("⚠️ Der Speicherplatz des Browsers ist voll (meist wegen vieler Fotos). Diese Änderung wurde nicht dauerhaft gespeichert. Tipp: über 💾 ein Backup sichern und ein paar Fotos verkleinern/entfernen, dann klappt's wieder.");
     }
+  }
+  triggerCloudPush();
+}
+
+/* ============================= CLOUD SYNC (Firebase) =============================
+   Damit sich die App auf mehreren Geräten (egal ob iPhone, Android, welcher Google-
+   Account etc.) automatisch synchronisiert, hier die Zugangsdaten eines kostenlosen
+   Firebase-Projekts eintragen. Ohne Eintrag läuft die App genau wie bisher rein lokal
+   auf diesem Gerät weiter – es wird dann gar nicht erst versucht, sich zu verbinden.
+   Anleitung zum Einrichten: siehe Nachricht/Datei "Cloud-Sync einrichten". */
+var FIREBASE_CONFIG = {
+  apiKey: "AIzaSyBwITaj9piiFVNhNcGQpd7i8zrz_aWAclo",
+  authDomain: "cotedazur-trip.firebaseapp.com",
+  projectId: "cotedazur-trip",
+  storageBucket: "cotedazur-trip.firebasestorage.app",
+  messagingSenderId: "878651536725",
+  appId: "1:878651536725:web:6b47a5429705ed71782bdc"
+};
+var SYNC_DOC_PATH = { collection: "cotedazur-sync", doc: "shared-trip" };
+
+var syncStatusEl = document.getElementById("sync-status");
+var syncDocRef = null;
+var syncPushTimer = null;
+var syncApplyingRemote = false;
+var syncConfigured = !!(FIREBASE_CONFIG.apiKey && FIREBASE_CONFIG.apiKey.indexOf("DEIN-") !== 0);
+
+function setSyncStatus(text, cls) {
+  if (!syncStatusEl) return;
+  syncStatusEl.textContent = text;
+  syncStatusEl.className = "sync-status" + (cls ? " " + cls : "");
+}
+
+function triggerCloudPush() {
+  if (!syncConfigured || !syncDocRef || syncApplyingRemote) return;
+  clearTimeout(syncPushTimer);
+  syncPushTimer = setTimeout(function () {
+    try {
+      syncDocRef.set({ data: JSON.stringify(state), updatedAt: firebase.firestore.FieldValue.serverTimestamp() })
+        .then(function () { setSyncStatus("☁️ synchronisiert", "sync-ok"); })
+        .catch(function () { setSyncStatus("⚠️ Sync-Fehler (nur lokal)", "sync-err"); });
+      var approxSize = JSON.stringify(state).length;
+      if (approxSize > 850000) {
+        setSyncStatus("⚠️ Daten fast zu groß für Sync – Fotos verkleinern", "sync-err");
+      }
+    } catch (e) {
+      setSyncStatus("⚠️ Sync-Fehler (nur lokal)", "sync-err");
+    }
+  }, 1000);
+}
+
+function initSync() {
+  if (!syncConfigured) { setSyncStatus("📴 nur lokal (Sync nicht eingerichtet)"); return; }
+  try {
+    setSyncStatus("🔄 verbinde…");
+    firebase.initializeApp(FIREBASE_CONFIG);
+    firebase.auth().signInAnonymously().catch(function () {
+      setSyncStatus("⚠️ Sync-Login fehlgeschlagen (nur lokal)", "sync-err");
+    });
+    firebase.auth().onAuthStateChanged(function (user) {
+      if (!user) return;
+      syncDocRef = firebase.firestore().collection(SYNC_DOC_PATH.collection).doc(SYNC_DOC_PATH.doc);
+      syncDocRef.onSnapshot(function (snap) {
+        if (snap.metadata.hasPendingWrites) return; // echo of our own not-yet-confirmed write, ignore
+        if (!snap.exists) { triggerCloudPush(); return; } // nothing in the cloud yet -> push our local state up
+        var remote = snap.data();
+        try {
+          var remoteState = JSON.parse(remote.data);
+          syncApplyingRemote = true;
+          state = remoteState;
+          save();
+          renderApp();
+          setSyncStatus("☁️ synchronisiert", "sync-ok");
+        } catch (e) {
+          // ignore malformed remote payload
+        } finally {
+          syncApplyingRemote = false;
+        }
+      }, function () {
+        setSyncStatus("⚠️ Sync-Verbindung verloren (nur lokal)", "sync-err");
+      });
+    });
+  } catch (e) {
+    setSyncStatus("⚠️ Sync-Konfiguration fehlerhaft (nur lokal)", "sync-err");
   }
 }
 
@@ -1699,6 +1790,7 @@ document.getElementById("reset-all-btn").addEventListener("click", function () {
 /* ============================= INIT ============================= */
 
 renderApp();
+initSync();
 
 })();
 </script>
